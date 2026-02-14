@@ -1,0 +1,377 @@
+"""
+Основной код Telegram бота для генерации изображений через Gemini Nano Banana
+Адаптировано для запуска на телефоне
+"""
+import io
+import logging
+from typing import Optional, Tuple
+
+import google.generativeai as genai
+from PIL import Image
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
+
+from config import settings
+
+# Настройка логирования
+logger = logging.getLogger(__name__)
+
+class GeminiImageGenerator:
+    """Класс для работы с Gemini API (генерация изображений)"""
+    
+    def __init__(self, api_key: str):
+        """Инициализация клиента Gemini"""
+        if not api_key:
+            raise ValueError("API ключ не предоставлен")
+        
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
+        logger.info(f"✅ Gemini клиент инициализирован (модель: {settings.GEMINI_MODEL})")
+    
+    async def generate_from_text(self, prompt: str) -> Optional[bytes]:
+        """
+        Генерация изображения из текстового описания
+        
+        Args:
+            prompt: Текстовое описание желаемого изображения
+            
+        Returns:
+            Байты изображения в формате PNG или None при ошибке
+        """
+        try:
+            logger.info(f"🎨 Генерация изображения из текста: {prompt[:50]}...")
+            
+            # Добавляем рекомендации для лучшего результата
+            enhanced_prompt = self._enhance_prompt(prompt)
+            
+            response = self.model.generate_content(
+                enhanced_prompt,
+                generation_config={"response_modalities": ["Text", "Image"]}
+            )
+            
+            return self._extract_image_from_response(response)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации: {e}")
+            return None
+    
+    async def generate_from_image_with_prompt(
+        self, 
+        prompt: str, 
+        image_data: bytes
+    ) -> Optional[bytes]:
+        """
+        Редактирование изображения на основе текстового описания
+        
+        Args:
+            prompt: Текстовое описание изменений
+            image_data: Байты исходного изображения
+            
+        Returns:
+            Байты измененного изображения или None при ошибке
+        """
+        try:
+            logger.info(f"🖼️ Редактирование изображения с промптом: {prompt[:50]}...")
+            
+            # Открываем изображение из байтов
+            image = Image.open(io.BytesIO(image_data))
+            
+            # Добавляем рекомендации для лучшего результата
+            enhanced_prompt = self._enhance_prompt(prompt, is_edit=True)
+            
+            response = self.model.generate_content(
+                [enhanced_prompt, image],
+                generation_config={"response_modalities": ["Text", "Image"]}
+            )
+            
+            return self._extract_image_from_response(response)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка редактирования: {e}")
+            return None
+    
+    def _enhance_prompt(self, prompt: str, is_edit: bool = False) -> str:
+        """
+        Улучшение промпта для лучших результатов
+        
+        Для стиля "нанобанана" добавляем специфические инструкции
+        """
+        if "нанобанана" in prompt.lower() or "nano banana" in prompt.lower():
+            # Если пользователь уже указал стиль, не меняем
+            return prompt
+        
+        # Для создания фигурок в стиле нанобанана
+        if "фигурк" in prompt.lower() or "figure" in prompt.lower() or "статуэтк" in prompt.lower():
+            style_prompt = f"""Create a 1/7 scale commercialized figure of {prompt}, 
+            in a realistic style and environment. Place the figure on a computer desk, 
+            using a circular transparent acrylic base without any text. On the computer screen, 
+            display the 3D modeling process of the figure."""
+            return style_prompt
+        
+        return prompt
+    
+    def _extract_image_from_response(self, response) -> Optional[bytes]:
+        """
+        Извлечение изображения из ответа Gemini
+        """
+        try:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data is not None:
+                    # Получаем данные изображения
+                    image_data = part.inline_data.data
+                    
+                    # Конвертируем в PNG для совместимости с Telegram
+                    image = Image.open(io.BytesIO(image_data))
+                    output = io.BytesIO()
+                    image.save(output, format='PNG')
+                    png_bytes = output.getvalue()
+                    
+                    logger.info("✅ Изображение успешно извлечено и конвертировано в PNG")
+                    return png_bytes
+            
+            logger.warning("⚠️ В ответе не найдено изображение")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка извлечения изображения: {e}")
+            return None
+
+
+class NanoBananaBot:
+    """Основной класс Telegram бота"""
+    
+    def __init__(self, token: str, gemini_key: str):
+        """
+        Инициализация бота
+        
+        Args:
+            token: Telegram Bot Token
+            gemini_key: Google Gemini API Key
+        """
+        self.token = token
+        self.application = Application.builder().token(token).build()
+        self.gemini = GeminiImageGenerator(gemini_key)
+        
+        # Регистрируем обработчики
+        self._register_handlers()
+        
+        logger.info("✅ Бот инициализирован")
+    
+    def _register_handlers(self):
+        """Регистрация всех обработчиков команд и сообщений"""
+        
+        # Команды
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("generate", self.generate_command))
+        
+        # Обработчики сообщений
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text)
+        )
+        self.application.add_handler(
+            MessageHandler(filters.PHOTO, self.handle_photo)
+        )
+        
+        # Обработчик ошибок
+        self.application.add_error_handler(self.error_handler)
+        
+        logger.info("✅ Обработчики зарегистрированы")
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        welcome_text = """
+🍌 **Добро пожаловать в Nano Banana Bot!**
+
+Я использую модель Google Gemini 2.5 Flash Image для создания удивительных изображений в стиле "нанобанана".
+
+**📝 Как пользоваться:**
+• Отправьте **текст** - создам изображение с нуля
+• Отправьте **фото с подписям (caption)** - отредактирую его
+• Используйте `/generate [текст]` - для генерации
+
+**✨ Примеры промптов:**
+• "фигурка девушки с красными волосами в стиле нанобанана"
+• "преврати это фото в пластиковую статуэтку на подставке"
+• "нанобанана версия этого персонажа"
+
+**ℹ️ Подробнее:** /help
+        """
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+        logger.info(f"Пользователь {update.effective_user.id} запустил бота")
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /help"""
+        help_text = """
+🔍 **Nano Banana Bot - Помощь**
+
+**🎨 Генерация из текста:**
+Просто отправьте описание того, что хотите увидеть:
+`Киберпанк город с неоновыми вывесками, дождь`
+
+**🖼️ Редактирование фото:**
+1. Отправьте фото
+2. В подписи (caption) напишите, что изменить:
+`преврати меня в пластиковую фигурку на подставке`
+
+**💡 Советы для лучших результатов:**
+• Будьте конкретны и детальны
+• Указывайте стиль (фотореализм, мультяшный, 3D)
+• Для фигурок используйте слова: "статуэтка", "figure", "нанобанана"
+
+**⚙️ Доступные команды:**
+/start - приветствие
+/help - эта справка
+/generate [текст] - генерация изображения
+
+**📱 Работает 24/7 прямо с вашего телефона!**
+        """
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    async def generate_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /generate [промпт]"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Пожалуйста, укажите описание после команды.\n"
+                "Пример: `/generate киберпанк город ночью`",
+                parse_mode='Markdown'
+            )
+            return
+        
+        prompt = " ".join(context.args)
+        
+        # Отправляем сообщение о начале генерации
+        status_msg = await update.message.reply_text(
+            "🎨 Генерирую изображение... это может занять несколько секунд"
+        )
+        
+        # Генерируем изображение
+        image_bytes = await self.gemini.generate_from_text(prompt)
+        
+        if image_bytes:
+            # Удаляем сообщение о статусе
+            await status_msg.delete()
+            
+            # Отправляем изображение
+            await update.message.reply_photo(
+                photo=io.BytesIO(image_bytes),
+                caption=f"✨ Сгенерировано по запросу: {prompt}"
+            )
+            logger.info(f"✅ Изображение отправлено пользователю {update.effective_user.id}")
+        else:
+            await status_msg.edit_text(
+                "❌ Не удалось сгенерировать изображение. Попробуйте другой промпт или повторите позже."
+            )
+    
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик текстовых сообщений (генерация из текста)"""
+        prompt = update.message.text
+        
+        # Отправляем сообщение о начале генерации
+        status_msg = await update.message.reply_text(
+            "🎨 Генерирую изображение из вашего описания..."
+        )
+        
+        # Генерируем изображение
+        image_bytes = await self.gemini.generate_from_text(prompt)
+        
+        if image_bytes:
+            await status_msg.delete()
+            await update.message.reply_photo(
+                photo=io.BytesIO(image_bytes),
+                caption=f"✨ Ваш запрос: {prompt[:100]}{'...' if len(prompt) > 100 else ''}"
+            )
+        else:
+            await status_msg.edit_text(
+                "❌ Не удалось сгенерировать изображение. Попробуйте другое описание."
+            )
+    
+    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик фото с подписью (редактирование изображения)"""
+        
+        # Проверяем, есть ли подпись к фото
+        if not update.message.caption:
+            await update.message.reply_text(
+                "📝 Пожалуйста, добавьте **подпись (caption)** к фото с описанием того, что изменить!",
+                parse_mode='Markdown'
+            )
+            return
+        
+        prompt = update.message.caption
+        
+        # Получаем фото максимального размера
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+        
+        # Отправляем сообщение о начале обработки
+        status_msg = await update.message.reply_text(
+            "🖼️ Обрабатываю ваше изображение... это может занять немного больше времени"
+        )
+        
+        # Редактируем изображение
+        result_bytes = await self.gemini.generate_from_image_with_prompt(prompt, bytes(image_bytes))
+        
+        if result_bytes:
+            await status_msg.delete()
+            await update.message.reply_photo(
+                photo=io.BytesIO(result_bytes),
+                caption=f"✨ Отредактировано: {prompt[:100]}{'...' if len(prompt) > 100 else ''}"
+            )
+        else:
+            await status_msg.edit_text(
+                "❌ Не удалось обработать изображение. Попробуйте другой промпт."
+            )
+    
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ошибок"""
+        logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+        
+        try:
+            if update and update.effective_message:
+                await update.effective_message.reply_text(
+                    "⚠️ Произошла ошибка. Пожалуйста, попробуйте позже."
+                )
+        except:
+            pass
+    
+    def run(self):
+        """Запуск бота"""
+        logger.info("🚀 Запуск бота...")
+        self.application.run_polling()
+
+
+def main():
+    """Точка входа в приложение"""
+    print("=" * 50)
+    print("🍌 Nano Banana Bot - Запуск")
+    print("=" * 50)
+    
+    try:
+        # Создаем и запускаем бота
+        bot = NanoBananaBot(
+            token=settings.TELEGRAM_BOT_TOKEN,
+            gemini_key=settings.GEMINI_API_KEY
+        )
+        
+        print("\n✅ Бот успешно запущен!")
+        print("📱 Откройте Telegram и найдите своего бота")
+        print("❌ Для остановки нажмите Ctrl+C\n")
+        
+        bot.run()
+        
+    except KeyboardInterrupt:
+        print("\n\n👋 Бот остановлен пользователем")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()

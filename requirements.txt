@@ -1,0 +1,8 @@
+# Основные зависимости
+python-telegram-bot>=20.0
+google-generativeai>=0.3.0
+Pillow>=9.0.0
+python-dotenv>=1.0.0
+
+# Для логирования
+loguru>=0.7.0
